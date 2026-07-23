@@ -1,0 +1,39 @@
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# API keys / secrets — NEVER commit these
+.env
+.env.local
+*.key
+config.local.py
+
+# Generated files
+docs/index.pkl
+docs/reconciliation_report.md
+docs/reconciliation_report.txt.md
+docs/*_report.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Streamlit
+.streamlit/secrets.toml
+
+# Logs
+*.log

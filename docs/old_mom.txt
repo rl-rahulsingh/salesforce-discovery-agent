@@ -1,0 +1,12 @@
+MoM v1 — Discovery Call (Acme Solar Services, initial capture)
+
+Engagement confirmed as a revamp of the live Service Cloud org, not greenfield; live processes must not be disrupted.
+Five intake channels agreed: Customer App, WhatsApp, Social, Phone, Email. L1 = external AI/CTI layer; consulting scope limited to integration (open + closed case payloads).
+TAT defined as Customer TAT: Case Created → Case Closed, measured from case creation, excluding Customer Waiting Time, OEM Approval Time, and Part Transit.
+SLA targets: Response 2 hrs, Site Visit 24 hrs, Resolution 48 hrs.
+Escalation matrix: >24h ASC Manager, >48h RI, >72h Service Head, >96h National Service Head; auto-notify via WA/SMS/Email.
+Feedback cycle: reminders D+1/D+3/D+5, auto-close at D+7 if no feedback received.
+Reschedule limits: Customer up to 2 times (then cancel), ASC 1 time; technician reschedule needs RM approval.
+Inventory: SFDC is visibility layer only; SAP executes all stock movement. Location hierarchy master data and Min/Max thresholds to be modeled.
+Reverse logistics: technician carries faulty part to ASC site; OEM picks up from ASC (pending OEM confirmation).
+Dual-status closure model agreed: WO closes for customer on-site replacement; internal status stays open until OEM confirmation + FOC delivery + faulty-part pickup.

@@ -1,0 +1,12 @@
+MoM v2 — same call, follow-up capture (Acme Solar Services)
+
+Engagement scoped as standardization of service operations on the existing org; a parallel sandbox rebuild option to be evaluated. (conflict: reopens revamp-vs-rebuild)
+Four intake channels noted: App, WhatsApp, Phone, Email; Social Media deferred to a later phase. (conflict: channel count)
+TAT to be measured in business hours from L2 allocation, not from case creation; exclusions to be finalized. (conflict: TAT start point + calendar vs business hours)
+SLA targets: Response 2 hrs, Site Visit 24 hrs, Resolution 72 hrs. (conflict: resolution target)
+Escalation: 3-tier matrix ending at Service Head at >72h; National Service Head tier "only for repeat calls." (conflict: tier 4 existence)
+Feedback reminders D+1 and D+2, with auto-close at D+6. (conflict: cadence + D+6/D+7 discrepancy)
+Customer may reschedule up to 3 times; reschedule resets the TAT clock. (conflict: limit + clock behavior)
+Business asked whether SFDC should become System of Record for ASC-level inventory, with SAP retained for central/regional only. (conflict: SOR vs visibility layer)
+Reverse logistics: OEM to continue customer-site pickup; ASC-site consolidation rejected as added ASC liability. (conflict: pickup point)
+Case to be closed for customer and internal on FSR submission; OEM settlement tracked as a separate financial process outside the case. (conflict: kills the dual-status model)

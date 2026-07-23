@@ -1,0 +1,8 @@
+Scope Note — Acme Solar Services Service Cloud Revamp (consulting scoped estimate)
+
+Revamp (not greenfield) of Acme Solar Services' live Service Cloud org to standardize service operations without disrupting production.
+Case Management end-to-end: L1 AI/CTI intake (integration only), L2 queue with SOP-guided capture and in-call WhatsApp image channel, remote closure with FSR + feedback cycle, WO/SA generation with async AI Scheduler integration.
+Field execution via LWC-on-Work-Order backend channel (ASC Coordinator, desktop): onboarding, guided diagnosis, faulty-parts list → L2 validation → Parts Approval Child WO → OEM partner decision (FOC vs internal attribution) under a dual customer/internal closure model.
+Inventory: location hierarchy master data, Min/Max per Location×Part×Brand with threshold alerts, new Inventory Manager persona with fulfilment LWC — SFDC as visibility/request layer only; SAP executes all stock movement.
+Preventive Maintenance custom-built (no FSL): asset-level frequency, advance WO generation via Apex batch, same-date breakdown merge; plus escalation/TAT (Milestones), reschedule rules, and architecture cleanup (object/field/Apex/trigger).
+Explicitly out or conditional: ASC native mobile app (future phase), SAP higher-level sync (add-on, not estimated), reverse-logistics pickup point and feedback cadence pending confirmation.
