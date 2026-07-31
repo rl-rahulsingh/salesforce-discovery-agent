@@ -116,7 +116,7 @@ def _render_trace_item(event: dict):
     return ""
 
 
-def _run_in_thread(workspace: str, task: str, event_q: queue.Queue):
+def _run_in_thread(engagement: str, task: str, event_q: queue.Queue):
     """
     Worker thread that runs the agent and pushes every event onto the queue.
     Main thread polls the queue to update the UI.
@@ -125,7 +125,7 @@ def _run_in_thread(workspace: str, task: str, event_q: queue.Queue):
         event_q.put(event)
 
     try:
-        final_text = run_agent(workspace, task, on_event=on_event)
+        final_text = run_agent(engagement, task, on_event=on_event)
         event_q.put({"type": "_done", "final_text": final_text})
     except Exception as e:
         event_q.put({"type": "_error", "error": str(e)})
@@ -148,12 +148,11 @@ left, right = st.columns([0.38, 0.62], gap="large")
 with left:
     st.subheader("Task")
 
-    workspace = st.text_input(
-        "Workspace folder",
-        value="./docs",
-        help="Folder containing your source .txt/.md files and the pre-built index.pkl.",
+    engagement = st.text_input(
+        "Engagement",
+        value="acme-solar",
+        help="Engagement slug to query, e.g. 'acme-solar'.",
     )
-
     task = st.text_area(
         "What should the agent do?",
         value="Reconcile the latest MoM against the prior scope. List all conflicts, open questions, and scope risks.",
@@ -178,7 +177,7 @@ with left:
         event_q: queue.Queue = queue.Queue()
         thread = threading.Thread(
             target=_run_in_thread,
-            args=(workspace, task, event_q),
+            args=(engagement, task, event_q),
             daemon=True,
         )
         thread.start()
@@ -199,7 +198,7 @@ with left:
                 st.session_state.final_text = event["final_text"]
                 # Look for a reconciliation report the agent wrote
                 for candidate in ("reconciliation_report.md", "reconciliation_report.txt.md"):
-                    p = os.path.join(workspace, candidate)
+                    p = os.path.join("outputs", candidate)
                     if os.path.exists(p):
                         st.session_state.final_report_path = p
                         break
