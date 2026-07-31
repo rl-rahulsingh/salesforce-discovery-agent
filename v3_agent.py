@@ -1,57 +1,78 @@
 """
-v3_agent.py — V3 agent with optional streaming callbacks for UI use.
+v3_agent.py — V3 agent, backed by Postgres/pgvector instead of a local pickle.
 
 Two ways to use this file:
-1. CLI (unchanged from before): py v3_agent.py ./docs "task"
-2. Programmatic with callbacks (for Streamlit app):
+1. CLI:  py v3_agent.py acme-solar "task"
+2. Programmatic with callbacks (for Streamlit / FastAPI):
      from v3_agent import run_agent
-     run_agent(workspace, task, on_event=my_callback)
+     run_agent(engagement, task, on_event=my_callback)
 
 The on_event callback receives structured dicts describing every step the
-agent takes — searches, tool calls, results, exit. UI consumes these to
-render the live trace. If on_event is None, the agent prints to stdout
-exactly like before, so existing CLI usage is unaffected.
+agent takes — searches, tool calls, results, exit. If on_event is None,
+the agent prints to stdout.
 """
 
 import json
 import os
-import pickle
 import sys
 
 import anthropic
-import numpy as np
+from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
+from supabase import create_client
+
+load_dotenv()
 
 MODEL = "claude-sonnet-4-6"
 TOP_K = 4
+OUTPUT_DIR = "outputs"
+
+# The embedding model must match the one used to build the stored vectors.
+# Previously this was read from index.pkl; with the pickle gone it lives here.
+# NOTE (Sprint 2): store this alongside the vectors so it cannot drift.
+# The vector(384) column dimension gives partial protection — a model with a
+# different output size would fail on insert — but two different 384-dim
+# models would fail silently, returning nonsense rankings.
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
 _EMBEDDING_MODEL = None
-_INDEX = None
+_SUPABASE = None
 
 
-def _lazy_load(workspace: str):
-    global _EMBEDDING_MODEL, _INDEX
-    if _INDEX is None:
-        index_path = os.path.join(workspace, "index.pkl")
-        with open(index_path, "rb") as f:
-            _INDEX = pickle.load(f)
-        _EMBEDDING_MODEL = SentenceTransformer(_INDEX["model_name"])
-    return _EMBEDDING_MODEL, _INDEX
+def _lazy_load():
+    """
+    Load the embedding model and Supabase client once, then reuse.
+
+    The model is ~90 MB and takes seconds to initialise, so loading it per
+    request would dominate response time. The corpus itself is no longer
+    loaded at all — it stays in Postgres.
+    """
+    global _EMBEDDING_MODEL, _SUPABASE
+    if _EMBEDDING_MODEL is None:
+        _EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    if _SUPABASE is None:
+        url = os.getenv("SUPABASE_URL")
+        key = os.getenv("SUPABASE_SECRET_KEY")
+        if not url or not key:
+            raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SECRET_KEY in .env")
+        _SUPABASE = create_client(url, key)
+    return _EMBEDDING_MODEL, _SUPABASE
 
 
-def _cosine_top_k(query_vec, chunk_vecs, k):
-    q_norm = query_vec / np.linalg.norm(query_vec)
-    c_norms = chunk_vecs / np.linalg.norm(chunk_vecs, axis=1, keepdims=True)
-    scores = c_norms @ q_norm
-    top_indices = np.argsort(scores)[-k:][::-1]
-    return top_indices, scores[top_indices]
+def resolve_engagement(slug: str) -> str:
+    """Turn a human-readable slug into the engagement's UUID."""
+    _, sb = _lazy_load()
+    res = sb.table("engagements").select("id, name").eq("slug", slug).execute()
+    if not res.data:
+        raise ValueError(f"No engagement with slug '{slug}'")
+    return res.data[0]["id"]
 
 
 TOOLS = [
     {
         "name": "list_documents",
         "description": (
-            "List all source document filenames available in the workspace. "
+            "List all source document filenames available for this engagement. "
             "Use this once at the start to know what documents exist. "
             "Note: you cannot read whole documents — use search_documents to query them."
         ),
@@ -79,7 +100,7 @@ TOOLS = [
     },
     {
         "name": "write_output",
-        "description": "Write the final reconciliation report (markdown) to a file in the workspace.",
+        "description": "Write the final reconciliation report (markdown) to the outputs folder.",
         "input_schema": {
             "type": "object",
             "properties": {
@@ -94,9 +115,9 @@ TOOLS = [
 SYSTEM_PROMPT = """You are a discovery-to-scope agent for a Salesforce consulting engagement.
 
 You have three tools:
-1. list_documents — see what source documents exist.
+1. list_documents — see what source documents exist for this engagement.
 2. search_documents — retrieve relevant chunks by semantic query.
-3. write_output — write the final report to disk.
+3. write_output — write the final report.
 
 Approach:
 - Start by listing documents to know the corpus.
@@ -127,34 +148,47 @@ def _emit(on_event, event: dict, fallback_print: bool):
             print(f"[exit] stop_reason={event['stop_reason']}")
 
 
-def run_tool(name: str, tool_input: dict, workspace: str) -> str:
+def run_tool(name: str, tool_input: dict, engagement_id: str) -> str:
+    model, sb = _lazy_load()
+
     if name == "list_documents":
-        files = [
-            f for f in os.listdir(workspace)
-            if f.endswith((".txt", ".md")) and f != "index.pkl"
-        ]
-        return json.dumps(files)
+        res = (
+            sb.table("documents")
+            .select("filename")
+            .eq("engagement_id", engagement_id)
+            .execute()
+        )
+        return json.dumps([row["filename"] for row in res.data])
 
     if name == "search_documents":
-        model, index = _lazy_load(workspace)
         query = tool_input["query"]
-        query_vec = model.encode(query)
-        chunk_vecs = np.array(index["vectors"])
-        top_indices, top_scores = _cosine_top_k(query_vec, chunk_vecs, TOP_K)
+        query_vec = model.encode(query).tolist()
 
-        results = []
-        for i, score in zip(top_indices, top_scores):
-            chunk = index["chunks"][int(i)]
-            results.append({
-                "score": round(float(score), 3),
-                "filename": chunk["filename"],
-                "chunk_index": chunk["chunk_index"],
-                "text": chunk["text"],
-            })
+        res = sb.rpc("match_chunks", {
+            "query_embedding":   query_vec,
+            "target_engagement": engagement_id,
+            "match_count":       TOP_K,
+        }).execute()
+
+        # Map the function's column names back to the shape the rest of the
+        # system already expects, so the UI and system prompt stay unchanged.
+        results = [
+            {
+                "score":       round(float(row["similarity"]), 3),
+                "filename":    row["chunk_file"],
+                "chunk_index": row["chunk_no"],
+                "text":        row["chunk_text"],
+            }
+            for row in res.data
+        ]
         return json.dumps(results, indent=2)
 
     if name == "write_output":
-        path = os.path.join(workspace, os.path.basename(tool_input["filename"]))
+        # Writes to outputs/, never to the folder that gets indexed.
+        # basename() still strips any directory component the model might
+        # supply — the agent should not choose where on disk to write.
+        os.makedirs(OUTPUT_DIR, exist_ok=True)
+        path = os.path.join(OUTPUT_DIR, os.path.basename(tool_input["filename"]))
         with open(path, "w", encoding="utf-8") as f:
             f.write(tool_input["content"])
         return f"Written to {path}"
@@ -162,18 +196,15 @@ def run_tool(name: str, tool_input: dict, workspace: str) -> str:
     return f"ERROR: unknown tool {name}"
 
 
-def run_agent(workspace: str, task: str, max_iterations: int = 15, on_event=None) -> str:
+def run_agent(engagement: str, task: str, max_iterations: int = 15, on_event=None) -> str:
     """
-    Run the agent. If on_event is provided, every step is streamed to that callback
-    as a structured dict. Otherwise, prints trace to stdout (original CLI behaviour).
+    Run the agent against one engagement.
 
-    Event shapes emitted:
-      {"type": "iteration_start", "iteration": N}
-      {"type": "search", "iteration": N, "query": "..."}
-      {"type": "tool_call", "iteration": N, "tool_name": "...", "tool_input": {...}}
-      {"type": "tool_result", "iteration": N, "tool_name": "...", "output": "..."}
-      {"type": "exit", "stop_reason": "...", "final_text": "..."}
+    `engagement` is the human-readable slug (e.g. "acme-solar"), resolved
+    once to a UUID and then used to scope every retrieval.
     """
+    engagement_id = resolve_engagement(engagement)
+
     client = anthropic.Anthropic()
     messages = [{"role": "user", "content": task}]
 
@@ -212,7 +243,7 @@ def run_agent(workspace: str, task: str, max_iterations: int = 15, on_event=None
                         "tool_input": block.input,
                     }, fallback_print=True)
 
-                output = run_tool(block.name, block.input, workspace)
+                output = run_tool(block.name, block.input, engagement_id)
 
                 _emit(on_event, {
                     "type": "tool_result",
@@ -234,6 +265,6 @@ def run_agent(workspace: str, task: str, max_iterations: int = 15, on_event=None
 
 if __name__ == "__main__":
     if len(sys.argv) < 3:
-        print('Usage: py v3_agent.py <docs_folder> "<task>"')
+        print('Usage: py v3_agent.py <engagement-slug> "<task>"')
         sys.exit(1)
     print(run_agent(sys.argv[1], sys.argv[2]))

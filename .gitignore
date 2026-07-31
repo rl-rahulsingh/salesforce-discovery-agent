@@ -21,6 +21,9 @@ docs/reconciliation_report.md
 docs/reconciliation_report.txt.md
 docs/*_report.md
 
+#Folder
+outputs/
+
 # IDE
 .vscode/
 .idea/
