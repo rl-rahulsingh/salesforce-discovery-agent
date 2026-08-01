@@ -141,6 +141,38 @@ TOOLS = [
             "required": ["filename", "content"],
         },
     },
+    {
+        "name": "save_extraction",
+        "description": (
+            "Save one structured finding to the database. Call this once per "
+            "distinct finding — one requirement, one conflict, one risk, etc. "
+            "Prefer this over write_output for structured results."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "type": {
+                    "type": "string",
+                    "enum": ["requirement", "decision", "risk", "open_question",
+                             "assumption", "action_item", "stakeholder", "conflict"],
+                    "description": "The kind of finding.",
+                },
+                "title": {"type": "string", "description": "A short one-line summary."},
+                "detail": {"type": "string", "description": "The full description."},
+                "severity": {
+                    "type": "string",
+                    "enum": ["high", "medium", "low"],
+                    "description": "For risks and conflicts. Omit otherwise.",
+                },
+                "source_chunks": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "List of {filename, chunk_index} this finding is based on.",
+                },
+            },
+            "required": ["type", "title"],
+        },
+    },
 ]
 
 SYSTEM_PROMPT = """You are a discovery-to-scope agent for a Salesforce consulting engagement.
@@ -158,10 +190,14 @@ Approach:
 - Cite the source filename + chunk index for every claim in your final report.
 - Only state what the retrieved chunks support. If evidence is thin or absent, flag it as an open question.
 
-Finally, call write_output with a markdown report:
-  Sections: Confirmed Requirements | Conflicts | Open Questions | Scope Risks.
+As you find each distinct item, call save_extraction for it — one call per
+requirement, conflict, risk, open question, or decision. Set type and severity
+correctly, and include source_chunks (filename + chunk_index) for traceability.
 
-You MUST call write_output as your final action. Do not respond in prose.
+After saving all findings, call write_output with a markdown summary report so
+there is still a human-readable artifact.
+
+You MUST save extractions and then write_output. Do not respond only in prose.
 """
 
 
@@ -223,6 +259,19 @@ def run_tool(name: str, tool_input: dict, engagement_id: str) -> str:
         with open(path, "w", encoding="utf-8") as f:
             f.write(tool_input["content"])
         return f"Written to {path}"
+
+    if name == "save_extraction":
+        sb = _get_db()
+        row = {
+            "engagement_id": engagement_id,
+            "type":          tool_input["type"],
+            "title":         tool_input["title"],
+            "detail":        tool_input.get("detail"),
+            "severity":      tool_input.get("severity"),
+            "source_chunks": tool_input.get("source_chunks"),
+        }
+        res = sb.table("extractions").insert(row).execute()
+        return f"Saved {tool_input['type']}: {tool_input['title']}"
 
     return f"ERROR: unknown tool {name}"
 
