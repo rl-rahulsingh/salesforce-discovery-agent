@@ -35,38 +35,69 @@ OUTPUT_DIR = "outputs"
 # models would fail silently, returning nonsense rankings.
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 
+
 _EMBEDDING_MODEL = None
 _SUPABASE = None
 
 
-def _lazy_load():
-    """
-    Load the embedding model and Supabase client once, then reuse.
-
-    The model is ~90 MB and takes seconds to initialise, so loading it per
-    request would dominate response time. The corpus itself is no longer
-    loaded at all — it stays in Postgres.
-    """
-    global _EMBEDDING_MODEL, _SUPABASE
-    if _EMBEDDING_MODEL is None:
-        _EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+def _get_db():
+    """Supabase client only. No model loading — this must stay cheap."""
+    global _SUPABASE
     if _SUPABASE is None:
         url = os.getenv("SUPABASE_URL")
         key = os.getenv("SUPABASE_SECRET_KEY")
         if not url or not key:
             raise RuntimeError("Missing SUPABASE_URL or SUPABASE_SECRET_KEY in .env")
         _SUPABASE = create_client(url, key)
-    return _EMBEDDING_MODEL, _SUPABASE
+    return _SUPABASE
+
+
+def _get_model():
+    """
+    Embedding model. Downloads ~90MB-400MB on first use of a given model,
+    so it is loaded only once the model name has been validated.
+    """
+    global _EMBEDDING_MODEL
+    if _EMBEDDING_MODEL is None:
+        _EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+    return _EMBEDDING_MODEL
 
 
 def resolve_engagement(slug: str) -> str:
     """Turn a human-readable slug into the engagement's UUID."""
-    _, sb = _lazy_load()
+    sb = _get_db()
     res = sb.table("engagements").select("id, name").eq("slug", slug).execute()
     if not res.data:
         raise ValueError(f"No engagement with slug '{slug}'")
     return res.data[0]["id"]
 
+def verify_embedding_model(engagement_id: str) -> None:
+    """
+    Refuse to run if the stored vectors were made by a different model.
+
+    Embeddings only compare within a single model's coordinate space.
+    Comparing a query from model B against chunks from model A produces
+    valid-looking numbers and meaningless rankings — the failure is
+    silent, so it must be caught explicitly.
+    """
+    sb = _get_db()
+    res = (
+        sb.table("chunks")
+        .select("model_name")
+        .eq("engagement_id", engagement_id)
+        .limit(1)
+        .execute()
+    )
+    if not res.data:
+        return  # no chunks yet — nothing to compare against
+
+    stored = res.data[0]["model_name"]
+    if stored != EMBEDDING_MODEL_NAME:
+        raise RuntimeError(
+            f"Embedding model mismatch. Chunks were embedded with '{stored}' "
+            f"but queries would use '{EMBEDDING_MODEL_NAME}'. "
+            f"Re-embed the corpus or restore the original model."
+        )
 
 TOOLS = [
     {
@@ -149,7 +180,7 @@ def _emit(on_event, event: dict, fallback_print: bool):
 
 
 def run_tool(name: str, tool_input: dict, engagement_id: str) -> str:
-    model, sb = _lazy_load()
+    sb = _get_db()
 
     if name == "list_documents":
         res = (
@@ -162,7 +193,7 @@ def run_tool(name: str, tool_input: dict, engagement_id: str) -> str:
 
     if name == "search_documents":
         query = tool_input["query"]
-        query_vec = model.encode(query).tolist()
+        query_vec = _get_model().encode(query).tolist()
 
         res = sb.rpc("match_chunks", {
             "query_embedding":   query_vec,
@@ -204,6 +235,7 @@ def run_agent(engagement: str, task: str, max_iterations: int = 15, on_event=Non
     once to a UUID and then used to scope every retrieval.
     """
     engagement_id = resolve_engagement(engagement)
+    verify_embedding_model(engagement_id)
 
     client = anthropic.Anthropic()
     messages = [{"role": "user", "content": task}]

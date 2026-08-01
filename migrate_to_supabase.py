@@ -110,6 +110,7 @@ for chunk, vector in zip(chunks, vectors):
         "chunk_index":   int(chunk["chunk_index"]),
         "text":          chunk["text"],
         "embedding":     vector.tolist(),
+        "model_name":    index["model_name"],
     })
 
 

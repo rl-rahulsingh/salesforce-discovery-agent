@@ -54,8 +54,8 @@ def list_engagements():
     Useful for a caller that needs to know what slugs are valid before
     submitting a run — and a cheap way to confirm the database is reachable.
     """
-    from v3_agent import _lazy_load
-    _, sb = _lazy_load()
+    from v3_agent import _get_db
+    sb = _get_db()
     res = sb.table("engagements").select("slug, name, created_at").execute()
     return {"engagements": res.data}
 
