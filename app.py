@@ -148,11 +148,75 @@ left, right = st.columns([0.38, 0.62], gap="large")
 with left:
     st.subheader("Task")
 
-    engagement = st.text_input(
-        "Engagement",
-        value="acme-solar",
-        help="Engagement slug to query, e.g. 'acme-solar'.",
-    )
+    # Engagement picker — reads from the database rather than trusting
+    # the user to remember a slug.
+    from v3_agent import _get_db
+
+    try:
+        _sb = _get_db()
+        _eng_rows = _sb.table("engagements").select("slug, name").execute().data
+    except Exception as e:
+        st.error(f"Cannot reach the database: {e}")
+        _eng_rows = []
+
+    _slugs = [r["slug"] for r in _eng_rows]
+
+    if not _slugs:
+        st.warning("No engagements yet. Create one below.")
+        engagement = None
+    else:
+        engagement = st.selectbox(
+            "Engagement",
+            options=_slugs,
+            help="Which client engagement to work on.",
+        )
+
+    with st.expander("➕ New engagement"):
+        _new_slug = st.text_input("Slug", placeholder="acme-solar", key="new_slug")
+        _new_name = st.text_input("Name", placeholder="Acme Solar — Discovery", key="new_name")
+        if st.button("Create", key="create_eng"):
+            if not _new_slug or not _new_name:
+                st.error("Both slug and name are required.")
+            elif _new_slug in _slugs:
+                st.error(f"'{_new_slug}' already exists.")
+            else:
+                _sb.table("engagements").insert(
+                    {"slug": _new_slug, "name": _new_name}
+                ).execute()
+                st.success(f"Created '{_new_slug}'.")
+                st.rerun()
+
+    # Document upload — chunking and embedding happen server-side.
+    with st.expander("📄 Documents"):
+        if engagement:
+            from ingest import ingest_document
+            from v3_agent import resolve_engagement
+
+            _eid = resolve_engagement(engagement)
+            _docs = _sb.table("documents").select("filename") \
+                .eq("engagement_id", _eid).execute().data
+
+            if _docs:
+                st.caption("Uploaded: " + ", ".join(d["filename"] for d in _docs))
+            else:
+                st.caption("No documents yet.")
+
+            _up = st.file_uploader(
+                "Upload a .txt or .md file",
+                type=["txt", "md"],
+                help="Re-uploading the same filename replaces the previous version.",
+            )
+            if _up is not None and st.button("Ingest", key="ingest_btn"):
+                try:
+                    _text = _up.read().decode("utf-8")
+                    _res = ingest_document(_eid, _up.name, _text)
+                    st.success(f"{_res['filename']}: {_res['chunks_created']} chunks stored.")
+                    st.rerun()
+                except UnicodeDecodeError:
+                    st.error("File must be UTF-8 text.")
+                except Exception as e:
+                    st.error(f"Ingest failed: {e}")
+
     task = st.text_area(
         "What should the agent do?",
         value="Reconcile the latest MoM against the prior scope. List all conflicts, open questions, and scope risks.",
@@ -166,7 +230,7 @@ with left:
         use_container_width=True,
     )
 
-    if run_btn and not st.session_state.is_running:
+    if run_btn and engagement and not st.session_state.is_running:
         # Reset state for a new run
         st.session_state.events = []
         st.session_state.final_text = ""
