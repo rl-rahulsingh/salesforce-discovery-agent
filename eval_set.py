@@ -1,89 +1,91 @@
 """
-eval_set.py — ground-truth test cases for retrieval evaluation.
+eval_set.py — ground truth for retrieval evaluation.
 
-Design principle: each test case names a query and the chunk(s) that MUST
-appear in the retriever's top-k for the retrieval to be considered correct.
+Hand-authored on 2026-08-02 against the live 12-chunk corpus for the
+acme-solar engagement. Verified by reading every chunk with
+inspect_chunks.py — not written from memory.
 
-The chunk identity is a tuple: (filename, chunk_index).
+IMPORTANT: chunk indices are tied to a specific chunking configuration
+(500 chars, 100 overlap) and a specific corpus. Re-chunk or re-ingest
+and this file must be rebuilt. It has already been invalidated once.
 
-Ground truth is hand-authored by inspecting the source documents.
+Format: (query, [list of (filename, chunk_index) that would each be a
+correct retrieval]). A query passes at k if ANY expected chunk appears
+in the top-k. That is recall@k: did we recover at least one chunk that
+actually answers the question?
 """
 
-# Format: (query, [list of (filename, chunk_index) that should be retrieved])
-#
-# A query passes retrieval eval if ANY of the expected chunks appears in
-# the retriever's top-k results. This is called "recall@k" — did we recover
-# at least one relevant chunk?
-#
-# Some queries have multiple valid answers (e.g., SLA info exists in both
-# old_mom and new_transcript — either or both being retrieved is a pass).
-#
-# Chunks were determined by running build_index.py and inspecting the
-# resulting chunk boundaries. Recompute if chunk parameters change.
-
 TEST_CASES = [
-    # Q1 — SLA response times. Answer sits in both MoM chunks 1 (SLA targets line).
+    # Q1 — SLA targets. Stated explicitly in both MoMs, with different
+    # resolution figures (48h vs 72h). Either is a correct retrieval.
     (
-        "What are the SLA response times?",
-        [("old_mom.txt", 1), ("new_transcript.txt", 1)],
+        "What are the SLA response and resolution targets?",
+        [("new_transcript.txt", 1), ("old_mom.txt", 1)],
     ),
 
-    # Q2 — Auto-close cadence. Both MoMs have D+6/D+7 auto-close rules.
-    # This is the query that FAILED in the Weekend 3 eval (topic dilution).
-    # Keeping it here as the canonical hard case.
+    # Q2 — Auto-close. The known-weak query. Scored 0.337 previously
+    # because the chunks holding it also carry SLA, escalation,
+    # reschedule and feedback content — classic topic dilution.
     (
-        "How are cases auto-closed?",
-        [("old_mom.txt", 1), ("new_transcript.txt", 1)],
-    ),
-
-    # Q3 — Escalation matrix. Both MoMs have escalation tier info.
-    (
-        "What is the escalation matrix?",
-        [("old_mom.txt", 1), ("new_transcript.txt", 1)],
-    ),
-
-    # Q4 — SAP integration / inventory role. Old MoM chunk 2, new_transcript chunk 2,
-    # and scope_note chunks 1-2 all discuss the SFDC-vs-SAP split.
-    (
-        "What is the integration with SAP?",
-        [("old_mom.txt", 2), ("new_transcript.txt", 2), ("scope_note.txt", 1), ("scope_note.txt", 2)],
-    ),
-
-    # Q5 — Reverse logistics pickup model. Old MoM chunk 2 and new_transcript chunks 2-3.
-    (
-        "How does reverse logistics work for faulty parts?",
-        [("old_mom.txt", 2), ("new_transcript.txt", 2), ("new_transcript.txt", 3)],
-    ),
-
-    # Q6 — Reschedule limits. Both MoMs have reschedule rules.
-    (
-        "How many times can a customer reschedule a visit?",
+        "When is a case auto-closed if the customer gives no feedback?",
         [("old_mom.txt", 1), ("new_transcript.txt", 1), ("new_transcript.txt", 2)],
     ),
 
-    # Q7 — Preventive maintenance. Only in scope_note.
+    # Q3 — Escalation matrix. Full tier list in old_mom #1; the revised
+    # 3-tier version in new_transcript #1.
     (
-        "What is in scope for Preventive Maintenance?",
+        "What is the escalation matrix and its tiers?",
+        [("old_mom.txt", 1), ("new_transcript.txt", 1)],
+    ),
+
+    # Q4 — Reschedule limits. Spans a chunk boundary in old_mom
+    # (#1 into #2) and in new_transcript (#1 into #2).
+    (
+        "How many times can a customer reschedule a visit?",
+        [("old_mom.txt", 1), ("old_mom.txt", 2),
+         ("new_transcript.txt", 1), ("new_transcript.txt", 2)],
+    ),
+
+    # Q5 — Inventory system of record. The SFDC-vs-SAP split appears
+    # in all three documents.
+    (
+        "Is SFDC the system of record for inventory or only a visibility layer?",
+        [("old_mom.txt", 2), ("new_transcript.txt", 2),
+         ("scope_note.txt", 1), ("scope_note.txt", 2)],
+    ),
+
+    # Q6 — Reverse logistics pickup point. Directly contradicted
+    # between the two MoMs; flagged as pending in the scope note.
+    (
+        "Where does the OEM collect faulty parts from?",
+        [("old_mom.txt", 2), ("new_transcript.txt", 2),
+         ("new_transcript.txt", 3), ("scope_note.txt", 3)],
+    ),
+
+    # Q7 — Preventive Maintenance. HARD CASE: exactly one chunk in the
+    # whole corpus mentions it. No overlapping neighbour to fall back on.
+    (
+        "What is in scope for preventive maintenance?",
         [("scope_note.txt", 2)],
     ),
 
-    # Q8 — Intake channels. Both MoMs, plus scope_note chunk 0 for the L1 layer.
+    # Q8 — Intake channels. Five in v1, four in v2 with Social deferred.
     (
         "What are the case intake channels?",
         [("old_mom.txt", 0), ("new_transcript.txt", 0)],
     ),
 
-    # Q9 — Dual-status closure model. Old MoM chunks 2-3, new_transcript chunk 3,
-    # scope_note chunk 1.
+    # Q9 — Dual-status closure. Agreed in v1, elaborated in the scope
+    # note, then eliminated in v2.
     (
-        "How does the dual-status closure model work?",
-        [("old_mom.txt", 3), ("new_transcript.txt", 3), ("scope_note.txt", 1)],
+        "How does the dual-status case closure model work?",
+        [("old_mom.txt", 2), ("old_mom.txt", 3),
+         ("new_transcript.txt", 3), ("scope_note.txt", 1)],
     ),
 
-    # Q10 — Engagement type (revamp vs greenfield). Old MoM chunk 0, new_transcript chunk 0,
-    # scope_note chunk 0.
+    # Q10 — Engagement approach. Stated in the opening chunk of all three.
     (
-        "Is this a revamp or a new build?",
+        "Is this a revamp of the live org or a greenfield rebuild?",
         [("old_mom.txt", 0), ("new_transcript.txt", 0), ("scope_note.txt", 0)],
     ),
 ]

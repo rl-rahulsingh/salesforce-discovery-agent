@@ -1,136 +1,98 @@
 """
-eval_retrieval.py — retrieval accuracy evaluation harness.
+eval_retrieval.py — measure retrieval accuracy against Postgres.
 
-Runs each test case in eval_set.py through the retriever, then measures:
+Runs every case in eval_set.py through match_chunks and reports
+recall@k. This tests the SAME path the agent uses, including the HNSW
+index — an eval against brute-force similarity would measure something
+you do not ship.
 
-1. recall@k for each k in {1, 3, 5} — did any expected chunk appear in top-k?
-2. Per-query breakdown so you can see which queries failed
-3. Overall pass/fail summary
-
-Run:
-    py eval_retrieval.py ./docs
-
-Prereqs: build_index.py must have been run on ./docs first (index.pkl exists).
+Run:  py eval_retrieval.py [engagement-slug]
 """
 
-import os
-import pickle
 import sys
-
-import numpy as np
-from sentence_transformers import SentenceTransformer
-
+from v3_agent import _get_db, _get_model, resolve_engagement, verify_embedding_model
 from eval_set import TEST_CASES
 
-# k values to measure — will show whether the answer shows up in top-1,
-# top-3, top-5. This lets you see how far down the ranked list your target
-# chunk sits when retrieval is "kind of right" but not perfect.
 K_VALUES = [1, 3, 5]
+MAX_K = max(K_VALUES)
 
 
-def load_index(workspace: str):
-    index_path = os.path.join(workspace, "index.pkl")
-    with open(index_path, "rb") as f:
-        index = pickle.load(f)
-    model = SentenceTransformer(index["model_name"])
-    return model, index
+def retrieve(sb, model, engagement_id, query, k):
+    """Return [(filename, chunk_index, similarity)] for the top-k."""
+    vec = model.encode(query).tolist()
+    res = sb.rpc("match_chunks", {
+        "query_embedding":   vec,
+        "target_engagement": engagement_id,
+        "match_count":       k,
+    }).execute()
+    return [(r["chunk_file"], r["chunk_no"], r["similarity"]) for r in res.data]
 
 
-def retrieve_top_k(model, index, query: str, k: int):
-    """Return top-k chunks as list of (filename, chunk_index, score)."""
-    query_vec = model.encode(query)
-    chunk_vecs = np.array(index["vectors"])
-    q_norm = query_vec / np.linalg.norm(query_vec)
-    c_norms = chunk_vecs / np.linalg.norm(chunk_vecs, axis=1, keepdims=True)
-    scores = c_norms @ q_norm
-    top_indices = np.argsort(scores)[-k:][::-1]
-    results = []
-    for i in top_indices:
-        chunk = index["chunks"][int(i)]
-        results.append((chunk["filename"], chunk["chunk_index"], float(scores[i])))
-    return results
+def main(slug: str):
+    sb = _get_db()
+    engagement_id = resolve_engagement(slug)
+    verify_embedding_model(engagement_id)   # fail fast on model drift
+    model = _get_model()
 
-
-def is_hit(retrieved, expected):
-    """
-    True if any expected (filename, chunk_index) appears in retrieved list.
-    This is 'recall' at the chunk level: did we find AT LEAST ONE right chunk?
-    """
-    retrieved_ids = {(f, ci) for f, ci, _ in retrieved}
-    expected_ids = set(expected)
-    return len(retrieved_ids & expected_ids) > 0
-
-
-def run_eval(workspace: str):
-    print(f"Loading index from {workspace}...")
-    model, index = load_index(workspace)
-    max_k = max(K_VALUES)
-
-    # Per-query results: dict of query -> {k: True/False}
     per_query = []
-    # Aggregate hits: dict of k -> hit count
-    hits_at_k = {k: 0 for k in K_VALUES}
+    hits = {k: 0 for k in K_VALUES}
 
-    print(f"\nRunning {len(TEST_CASES)} test cases...\n")
-    print(f"{'#':>3} | {'k=1':>5} | {'k=3':>5} | {'k=5':>5} | Query")
-    print("-" * 90)
+    print(f"\nEngagement: {slug}   Cases: {len(TEST_CASES)}\n")
+    print(f"{'#':>3} | {'k=1':^5} | {'k=3':^5} | {'k=5':^5} | {'top':>5} | Query")
+    print("-" * 100)
 
     for i, (query, expected) in enumerate(TEST_CASES, start=1):
-        retrieved = retrieve_top_k(model, index, query, max_k)
+        results = retrieve(sb, model, engagement_id, query, MAX_K)
+        expected_set = set(expected)
 
-        # For each k, check if any expected chunk appears in top-k
-        query_result = {}
+        row = {}
         for k in K_VALUES:
-            top_k = retrieved[:k]
-            hit = is_hit(top_k, expected)
-            query_result[k] = hit
+            found = {(f, c) for f, c, _ in results[:k]}
+            hit = bool(found & expected_set)
+            row[k] = hit
             if hit:
-                hits_at_k[k] += 1
+                hits[k] += 1
 
-        # One-line row per query
-        row = f"{i:>3} | " + " | ".join(
-            f"{'  ✓  ' if query_result[k] else '  ✗  '}" for k in K_VALUES
-        )
-        print(f"{row} | {query}")
+        marks = " | ".join("  ✓  " if row[k] else "  ✗  " for k in K_VALUES)
+        top_score = results[0][2] if results else 0.0
+        print(f"{i:>3} | {marks} | {top_score:>5.3f} | {query}")
 
-        per_query.append({
-            "query": query,
-            "expected": expected,
-            "retrieved": retrieved,
-            "hits": query_result,
-        })
+        per_query.append({"query": query, "expected": expected,
+                          "results": results, "hits": row})
 
-    # Summary
     n = len(TEST_CASES)
-    print("\n" + "=" * 90)
-    print("SUMMARY — recall@k across all test cases")
-    print("=" * 90)
+    print("\n" + "=" * 100)
+    print("RECALL@K")
+    print("=" * 100)
     for k in K_VALUES:
-        pct = 100 * hits_at_k[k] / n
-        print(f"  recall@{k}: {hits_at_k[k]:>2}/{n} = {pct:>5.1f}%")
+        print(f"  recall@{k}: {hits[k]:>2}/{n} = {100*hits[k]/n:>5.1f}%")
 
-    # Detail on failures — this is the actionable output.
-    # A failure at k=5 means top 5 chunks didn't contain the answer.
-    print("\n" + "=" * 90)
-    print("FAILURES at k=5 — queries where even top-5 missed the target")
-    print("=" * 90)
-    any_failures = False
-    for entry in per_query:
-        if not entry["hits"][max_k]:
-            any_failures = True
-            print(f"\n  Query: \"{entry['query']}\"")
-            print(f"  Expected any of: {entry['expected']}")
-            print(f"  Got (top {max_k}):")
-            for fname, ci, score in entry["retrieved"]:
-                print(f"    - {fname} chunk {ci}  (score={score:.3f})")
-    if not any_failures:
-        print("  None — every query retrieved at least one expected chunk in top-5.")
+    print("\n" + "=" * 100)
+    print(f"FAILURES AT k={MAX_K} — the actionable output")
+    print("=" * 100)
+    any_fail = False
+    for e in per_query:
+        if not e["hits"][MAX_K]:
+            any_fail = True
+            print(f"\n  Query    : \"{e['query']}\"")
+            print(f"  Expected : {e['expected']}")
+            print(f"  Returned :")
+            for f, c, s in e["results"]:
+                print(f"      {s:>6.3f}  {f} #{c}")
+    if not any_fail:
+        print("  None. Every query recovered a correct chunk within the top 5.")
 
-    return per_query, hits_at_k
+    # Low-confidence passes: correct, but only just. These are the ones a
+    # similarity threshold would silently discard.
+    print("\n" + "=" * 100)
+    print("LOW-CONFIDENCE PASSES — correct chunk found, top score below 0.40")
+    print("=" * 100)
+    weak = [e for e in per_query if e["hits"][MAX_K] and e["results"][0][2] < 0.40]
+    if not weak:
+        print("  None.")
+    for e in weak:
+        print(f"  {e['results'][0][2]:.3f}  \"{e['query']}\"")
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: py eval_retrieval.py <workspace_folder>")
-        sys.exit(1)
-    run_eval(sys.argv[1])
+    main(sys.argv[1] if len(sys.argv) > 1 else "acme-solar")
