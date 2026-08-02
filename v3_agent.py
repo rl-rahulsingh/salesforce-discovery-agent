@@ -20,6 +20,8 @@ import anthropic
 from dotenv import load_dotenv
 from sentence_transformers import SentenceTransformer
 from supabase import create_client
+from contextlib import nullcontext
+from langfuse import observe, get_client
 
 load_dotenv()
 
@@ -39,6 +41,21 @@ EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 _EMBEDDING_MODEL = None
 _SUPABASE = None
 
+def _tracing_on() -> bool:
+    """Tracing is optional — the agent must run without it."""
+    return bool(os.getenv("LANGFUSE_PUBLIC_KEY"))
+
+
+def _obs(name: str, **kwargs):
+    """
+    Open an observation, or a no-op context if tracing is off.
+
+    nullcontext() lets the same `with` block work either way, so there
+    are no `if tracing:` branches scattered through the agent loop.
+    """
+    if not _tracing_on():
+        return nullcontext(None)
+    return get_client().start_as_current_observation(name=name, **kwargs)
 
 def _get_db():
     """Supabase client only. No model loading — this must stay cheap."""
@@ -142,35 +159,41 @@ TOOLS = [
         },
     },
     {
-        "name": "save_extraction",
+        "name": "save_extractions",
         "description": (
-            "Save one structured finding to the database. Call this once per "
-            "distinct finding — one requirement, one conflict, one risk, etc. "
-            "Prefer this over write_output for structured results."
+            "Save ALL your findings in ONE call. Pass a list containing every "
+            "requirement, conflict, risk, open question and decision you have "
+            "identified. Do not call this once per finding — collect them all "
+            "and save them together."
         ),
         "input_schema": {
             "type": "object",
             "properties": {
-                "type": {
-                    "type": "string",
-                    "enum": ["requirement", "decision", "risk", "open_question",
-                             "assumption", "action_item", "stakeholder", "conflict"],
-                    "description": "The kind of finding.",
-                },
-                "title": {"type": "string", "description": "A short one-line summary."},
-                "detail": {"type": "string", "description": "The full description."},
-                "severity": {
-                    "type": "string",
-                    "enum": ["high", "medium", "low"],
-                    "description": "For risks and conflicts. Omit otherwise.",
-                },
-                "source_chunks": {
+                "items": {
                     "type": "array",
-                    "items": {"type": "object"},
-                    "description": "List of {filename, chunk_index} this finding is based on.",
-                },
+                    "description": "Every finding, as a list.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "type": {
+                                "type": "string",
+                                "enum": ["requirement", "decision", "risk", "open_question",
+                                         "assumption", "action_item", "stakeholder", "conflict"],
+                            },
+                            "title": {"type": "string", "description": "Short one-line summary."},
+                            "detail": {"type": "string", "description": "Full description."},
+                            "severity": {"type": "string", "enum": ["high", "medium", "low"]},
+                            "source_chunks": {
+                                "type": "array",
+                                "items": {"type": "object"},
+                                "description": "List of {filename, chunk_index}.",
+                            },
+                        },
+                        "required": ["type", "title"],
+                    },
+                }
             },
-            "required": ["type", "title"],
+            "required": ["items"],
         },
     },
 ]
@@ -260,28 +283,39 @@ def run_tool(name: str, tool_input: dict, engagement_id: str) -> str:
             f.write(tool_input["content"])
         return f"Written to {path}"
 
-    if name == "save_extraction":
+    if name == "save_extractions":
         sb = _get_db()
-        row = {
+        items = tool_input.get("items", [])
+        if not items:
+            return "ERROR: no items provided."
+
+        rows = [{
             "engagement_id": engagement_id,
-            "type":          tool_input["type"],
-            "title":         tool_input["title"],
-            "detail":        tool_input.get("detail"),
-            "severity":      tool_input.get("severity"),
-            "source_chunks": tool_input.get("source_chunks"),
-        }
-        res = sb.table("extractions").insert(row).execute()
-        return f"Saved {tool_input['type']}: {tool_input['title']}"
+            "type":          it["type"],
+            "title":         it["title"],
+            "detail":        it.get("detail"),
+            "severity":      it.get("severity"),
+            "source_chunks": it.get("source_chunks"),
+        } for it in items]
 
-    return f"ERROR: unknown tool {name}"
+        # One insert for the whole list — one network round trip
+        # instead of one per finding.
+        sb.table("extractions").insert(rows).execute()
+
+        counts = {}
+        for it in items:
+            counts[it["type"]] = counts.get(it["type"], 0) + 1
+        summary = ", ".join(f"{v} {k}" for k, v in sorted(counts.items()))
+        return f"Saved {len(rows)} extractions: {summary}"
 
 
+@observe(name="discovery_agent_run")
 def run_agent(engagement: str, task: str, max_iterations: int = 15, on_event=None) -> str:
     """
     Run the agent against one engagement.
 
-    `engagement` is the human-readable slug (e.g. "acme-solar"), resolved
-    once to a UUID and then used to scope every retrieval.
+    @observe creates the root trace. Every observation opened inside
+    this call nests under it automatically via OpenTelemetry context.
     """
     engagement_id = resolve_engagement(engagement)
     verify_embedding_model(engagement_id)
@@ -292,55 +326,68 @@ def run_agent(engagement: str, task: str, max_iterations: int = 15, on_event=Non
     for i in range(max_iterations):
         _emit(on_event, {"type": "iteration_start", "iteration": i + 1}, fallback_print=False)
 
-        response = client.messages.create(
-            model=MODEL,
-            max_tokens=8000,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
+        with _obs(f"iteration_{i+1}", as_type="span"):
 
-        if response.stop_reason != "tool_use":
-            final_text = "".join(b.text for b in response.content if b.type == "text")
-            _emit(on_event, {"type": "exit", "stop_reason": response.stop_reason, "final_text": final_text}, fallback_print=True)
-            return final_text
+            # The model call sits INSIDE the generation context so the
+            # recorded duration is the real API latency.
+            with _obs("anthropic_call", as_type="generation",
+                      model=MODEL,
+                      input=messages[-1] if messages else None) as gen:
 
-        messages.append({"role": "assistant", "content": response.content})
+                response = client.messages.create(
+                    model=MODEL,
+                    max_tokens=8000,
+                    system=SYSTEM_PROMPT,
+                    tools=TOOLS,
+                    messages=messages,
+                )
 
-        tool_results = []
-        for block in response.content:
-            if block.type == "tool_use":
-                if block.name == "search_documents":
-                    _emit(on_event, {
-                        "type": "search",
-                        "iteration": i + 1,
-                        "query": block.input.get("query", ""),
-                    }, fallback_print=True)
-                else:
-                    _emit(on_event, {
-                        "type": "tool_call",
-                        "iteration": i + 1,
-                        "tool_name": block.name,
-                        "tool_input": block.input,
-                    }, fallback_print=True)
+                if gen:
+                    gen.update(
+                        output=[b.model_dump() for b in response.content],
+                        usage_details={
+                            "input": response.usage.input_tokens,
+                            "output": response.usage.output_tokens,
+                        },
+                    )
 
-                output = run_tool(block.name, block.input, engagement_id)
+            if response.stop_reason != "tool_use":
+                final_text = "".join(b.text for b in response.content if b.type == "text")
+                _emit(on_event, {"type": "exit", "stop_reason": response.stop_reason,
+                                 "final_text": final_text}, fallback_print=True)
+                return final_text
 
-                _emit(on_event, {
-                    "type": "tool_result",
-                    "iteration": i + 1,
-                    "tool_name": block.name,
-                    "output": output,
-                }, fallback_print=False)
+            messages.append({"role": "assistant", "content": response.content})
 
-                tool_results.append({
-                    "type": "tool_result",
-                    "tool_use_id": block.id,
-                    "content": output,
-                })
-        messages.append({"role": "user", "content": tool_results})
+            tool_results = []
+            for block in response.content:
+                if block.type == "tool_use":
+                    if block.name == "search_documents":
+                        _emit(on_event, {"type": "search", "iteration": i + 1,
+                                         "query": block.input.get("query", "")}, fallback_print=True)
+                    else:
+                        _emit(on_event, {"type": "tool_call", "iteration": i + 1,
+                                         "tool_name": block.name,
+                                         "tool_input": block.input}, fallback_print=True)
 
-    _emit(on_event, {"type": "exit", "stop_reason": "max_iterations", "final_text": "Stopped: hit max_iterations safety cap."}, fallback_print=True)
+                    with _obs(f"tool_{block.name}", as_type="tool",
+                              input=block.input) as tspan:
+                        output = run_tool(block.name, block.input, engagement_id)
+                        if tspan:
+                            tspan.update(output=output[:2000])
+
+                    _emit(on_event, {"type": "tool_result", "iteration": i + 1,
+                                     "tool_name": block.name, "output": output}, fallback_print=False)
+
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": output,
+                    })
+            messages.append({"role": "user", "content": tool_results})
+
+    _emit(on_event, {"type": "exit", "stop_reason": "max_iterations",
+                     "final_text": "Stopped: hit max_iterations safety cap."}, fallback_print=True)
     return "Stopped: hit max_iterations safety cap."
 
 
@@ -349,3 +396,5 @@ if __name__ == "__main__":
         print('Usage: py v3_agent.py <engagement-slug> "<task>"')
         sys.exit(1)
     print(run_agent(sys.argv[1], sys.argv[2]))
+    if _tracing_on():
+        get_client().flush()
