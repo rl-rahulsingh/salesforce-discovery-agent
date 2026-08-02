@@ -200,29 +200,33 @@ TOOLS = [
 
 SYSTEM_PROMPT = """You are a discovery-to-scope agent for a Salesforce consulting engagement.
 
-You have three tools:
+You have four tools:
 1. list_documents — see what source documents exist for this engagement.
 2. search_documents — retrieve relevant chunks by semantic query.
-3. write_output — write the final report.
+3. save_extractions — save ALL findings to the database in ONE call.
+4. write_output — write a human-readable markdown summary.
 
-Approach:
-- Start by listing documents to know the corpus.
-- Then run several targeted searches to gather evidence — one per topic you need to compare
-  (e.g., SLA targets, auto-close rules, escalation matrix, SAP integration, reverse logistics).
-- For reconciliation, cross-check chunks from different source documents on the same topic.
-- Cite the source filename + chunk index for every claim in your final report.
-- Only state what the retrieved chunks support. If evidence is thin or absent, flag it as an open question.
+Work in this order:
+1. list_documents to see the corpus.
+2. Run several targeted searches to gather evidence — one per topic you need
+   to compare (e.g., SLA targets, auto-close rules, escalation matrix, SAP
+   integration, reverse logistics). Batch multiple searches per turn.
+3. When you have gathered everything, call save_extractions ONCE with a list
+   containing every finding. Do not call it repeatedly.
+4. Finally call write_output with a markdown summary.
 
-As you find each distinct item, call save_extraction for it — one call per
-requirement, conflict, risk, open question, or decision. Set type and severity
-correctly, and include source_chunks (filename + chunk_index) for traceability.
+Quality rules:
+- For reconciliation, cross-check chunks from different source documents on the
+  same topic.
+- Cite the source filename + chunk index for every claim, via source_chunks.
+- Only state what the retrieved chunks support. If evidence is thin or absent,
+  flag it as an open question rather than asserting it.
 
-After saving all findings, call write_output with a markdown summary report so
-there is still a human-readable artifact.
+Efficiency: each round trip resends the whole conversation, so batch your
+searches and save all findings in a single call.
 
-You MUST save extractions and then write_output. Do not respond only in prose.
+You MUST call save_extractions and then write_output. Do not respond only in prose.
 """
-
 
 def _emit(on_event, event: dict, fallback_print: bool):
     """Send an event to the callback if provided, else print to stdout."""
@@ -310,6 +314,30 @@ def run_tool(name: str, tool_input: dict, engagement_id: str) -> str:
 
 
 @observe(name="discovery_agent_run")
+
+def _set_cache_breakpoint(messages):
+    """
+    Mark the end of the conversation so far as cacheable.
+
+    Anthropic caches everything before a breakpoint. Since history never
+    changes once written, the next call reads it from cache and pays full
+    price only for what is new.
+
+    Only one rolling breakpoint is kept — old ones are cleared, because
+    the API allows a limited number.
+    """
+    for m in messages:
+        if isinstance(m.get("content"), list):
+            for blk in m["content"]:
+                if isinstance(blk, dict):
+                    blk.pop("cache_control", None)
+
+    last = messages[-1]
+    if isinstance(last.get("content"), list) and last["content"]:
+        blk = last["content"][-1]
+        if isinstance(blk, dict):
+            blk["cache_control"] = {"type": "ephemeral"}
+
 def run_agent(engagement: str, task: str, max_iterations: int = 15, on_event=None) -> str:
     """
     Run the agent against one engagement.
@@ -334,10 +362,16 @@ def run_agent(engagement: str, task: str, max_iterations: int = 15, on_event=Non
                       model=MODEL,
                       input=messages[-1] if messages else None) as gen:
 
+                _set_cache_breakpoint(messages)
+
                 response = client.messages.create(
                     model=MODEL,
                     max_tokens=8000,
-                    system=SYSTEM_PROMPT,
+                    system=[{
+                        "type": "text",
+                        "text": SYSTEM_PROMPT,
+                        "cache_control": {"type": "ephemeral"},
+                    }],
                     tools=TOOLS,
                     messages=messages,
                 )

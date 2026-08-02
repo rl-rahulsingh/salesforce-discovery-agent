@@ -140,3 +140,67 @@ looks like good engineering.
   varies between runs, so cost varies too. A cost *range* would need repeats.
 - **Cost scales with corpus.** 12 chunks today. More documents means more
   searches, more retrieved text per call, and larger conversations.
+
+  ---
+
+## Run 3 — prompt caching added
+
+| Iter | Fresh in | Cache write | Cache read | Output | API s |
+|---|---|---|---|---|---|
+| 1 | 332 | 1,047 | 0 | 60 | 2.6 |
+| 3 | 1 | 3,880 | 1,471 | 268 | 5.4 |
+| 5 | 1 | 3,673 | 9,153 | 5,326 | 77.9 |
+| 7 | 1 | 4,140 | 17,586 | 1,098 | 22.8 |
+
+- Fresh input: 338 → $0.0010
+- Cache writes: 21,726 → $0.0815 (1.25x premium, paid once per segment)
+- Cache reads: 47,434 → $0.0142 (0.1x)
+- Output: 11,358 → $0.1704
+- **Total: $0.2671** · 202s
+
+Same tokens without caching: $0.3789. **Saved 30%.**
+
+---
+
+## Cumulative result
+
+| Run | Change | Cost | Iterations | Completed |
+|---|---|---|---|---|
+| 1 | Baseline | $0.6475 | 15 | No — hit cap |
+| 2 | Batched saves | $0.3628 | 7 | Yes |
+| 3 | + Prompt caching | $0.2671 | 7 | Yes |
+
+**59% cheaper than baseline, and the run now completes.**
+
+---
+
+## Finding 5 — the bottleneck moved
+
+| | Run 1 | Run 3 |
+|---|---|---|
+| Input share of cost | 87% | 36% |
+| Output share of cost | 13% | **64%** |
+
+Optimising input worked so well that input is no longer the problem.
+Output now dominates.
+
+**Consequence:** further input optimisation has little left to give. To
+reduce cost from here, the model must write less — shorter reports,
+tighter output schemas, fewer verbose fields.
+
+Because output also drives latency (~65 tok/s), cost and latency now share
+a single lever. Earlier they were independent.
+
+**General lesson:** fix a bottleneck and a different one surfaces. Re-measure
+after every optimisation rather than applying the same fix harder.
+
+---
+
+## Finding 6 — caching is a bet, not free money
+
+Cache writes cost a 25% premium; reads cost 90% less. The saving depends
+entirely on the read-to-write ratio.
+
+This run: 47,434 reads against 21,726 writes — roughly 2:1, comfortably
+profitable. A longer run improves the ratio as cached content is reused
+more. **A very short run could cost more with caching than without.**
